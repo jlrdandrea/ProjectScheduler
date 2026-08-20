@@ -399,6 +399,23 @@ class ProjectScheduler {
     return count;
   }
   
+  /**
+   * Signed working-day offset from one date to another.
+   * Positive = toDate is later than fromDate; negative = earlier.
+   * @private
+   */
+  _signedWorkingDaysDiff(fromDate, toDate) {
+    const from = this._normalizeDate(new Date(fromDate));
+    const to = this._normalizeDate(new Date(toDate));
+    
+    if (from.getTime() === to.getTime()) return 0;
+    
+    if (to > from) {
+      return this._workingDaysBetween(from, to) - 1;
+    }
+    return -(this._workingDaysBetween(to, from) - 1);
+  }
+  
   // ============================================================
   // CRITICAL PATH METHOD (CPM) CALCULATION
   // ============================================================
@@ -653,6 +670,295 @@ class ProjectScheduler {
         ? task.plannedStart 
         : this._addWorkingDays(this.startDate, task.earlyFinish - 1);
     });
+  }
+  
+  // ============================================================
+  // BASELINE & VARIANCE TRACKING
+  // ============================================================
+  
+  /**
+   * Capture a baseline snapshot of the current calculated schedule.
+   * Call this once the plan is approved (e.g., at project kick-off,
+   * or after a re-baseline following an approved change request).
+   * 
+   * @param {string} baselineId - Unique identifier, e.g. 'BL0', 'BL1'
+   * @param {Object} [options]
+   * @param {string} [options.label] - Human-readable label, e.g. 'Approved Baseline'
+   * @param {boolean} [options.setActive=true] - Make this the active baseline for variance comparisons
+   * @returns {Object} The stored baseline snapshot
+   */
+  captureBaseline(baselineId, options = {}) {
+    if (!baselineId) {
+      throw new Error('captureBaseline requires a baselineId');
+    }
+    if (this.baselines.has(baselineId)) {
+      throw new Error(`Baseline "${baselineId}" already exists`);
+    }
+    
+    if (!this._scheduleCalculated) {
+      this.calculateSchedule();
+    }
+    
+    const taskSnapshots = new Map();
+    this.tasks.forEach(task => {
+      taskSnapshots.set(task.taskId, {
+        name: task.name,
+        duration: task.duration,
+        plannedStart: task.plannedStart,
+        plannedFinish: task.plannedFinish,
+        earlyStart: task.earlyStart,
+        earlyFinish: task.earlyFinish,
+        totalFloat: task.totalFloat,
+        isCritical: task.isCritical,
+        percentComplete: task.percentComplete
+      });
+    });
+    
+    const projectEndDay = Math.max(...this.getAllTasks().map(t => t.earlyFinish));
+    const projectEndDate = this._addWorkingDays(this.startDate, projectEndDay - 1);
+    
+    const baseline = {
+      baselineId,
+      label: options.label || baselineId,
+      capturedAt: new Date(),
+      projectStartDate: new Date(this.startDate),
+      projectEndDate,
+      tasks: taskSnapshots
+    };
+    
+    this.baselines.set(baselineId, baseline);
+    
+    if (options.setActive !== false) {
+      this.activeBaselineId = baselineId;
+    }
+    
+    return baseline;
+  }
+  
+  /**
+   * Remove a stored baseline
+   * @param {string} baselineId
+   * @returns {boolean}
+   */
+  deleteBaseline(baselineId) {
+    const existed = this.baselines.delete(baselineId);
+    if (this.activeBaselineId === baselineId) {
+      this.activeBaselineId = null;
+    }
+    return existed;
+  }
+  
+  /**
+   * Set which stored baseline is used for variance comparisons
+   * @param {string} baselineId
+   */
+  setActiveBaseline(baselineId) {
+    if (!this.baselines.has(baselineId)) {
+      throw new Error(`Baseline "${baselineId}" does not exist`);
+    }
+    this.activeBaselineId = baselineId;
+  }
+  
+  /**
+   * List all stored baselines (metadata only, no task detail)
+   * @returns {Array<Object>}
+   */
+  listBaselines() {
+    return Array.from(this.baselines.values()).map(b => ({
+      baselineId: b.baselineId,
+      label: b.label,
+      capturedAt: b.capturedAt,
+      projectStartDate: this._formatDate(b.projectStartDate),
+      projectEndDate: this._formatDate(b.projectEndDate),
+      taskCount: b.tasks.size,
+      isActive: b.baselineId === this.activeBaselineId
+    }));
+  }
+  
+  /**
+   * Record actual start/finish/progress for a task. This is the normal way
+   * to feed real-world progress into the tracker as work happens.
+   * 
+   * @param {string} taskId
+   * @param {Object} actuals
+   * @param {Date|string} [actuals.actualStart]
+   * @param {Date|string} [actuals.actualFinish]
+   * @param {number} [actuals.percentComplete]
+   * @param {string} [actuals.status]
+   * @returns {Object} Updated task
+   */
+  recordActual(taskId, actuals = {}) {
+    const task = this.tasks.get(taskId);
+    if (!task) {
+      throw new Error(`Task "${taskId}" not found`);
+    }
+    
+    const updates = {};
+    if (actuals.actualStart) updates.actualStart = this._normalizeDate(new Date(actuals.actualStart));
+    if (actuals.actualFinish) updates.actualFinish = this._normalizeDate(new Date(actuals.actualFinish));
+    if (actuals.percentComplete !== undefined) updates.percentComplete = actuals.percentComplete;
+    if (actuals.status) updates.status = actuals.status;
+    
+    // Auto-complete: if percentComplete hits 100 and no actualFinish given, don't assume -
+    // leave it to the PMO tool to set actualFinish explicitly (avoids guessing a date).
+    
+    return this.updateTask(taskId, updates);
+  }
+  
+  /**
+   * Compute schedule variance for a single task against a baseline.
+   * Uses actual dates where recorded, otherwise falls back to the
+   * current forecast (recalculated planned dates).
+   * 
+   * @param {string} taskId
+   * @param {string} [baselineId] - Defaults to the active baseline
+   * @returns {Object} Variance detail
+   */
+  getTaskVariance(taskId, baselineId = this.activeBaselineId) {
+    if (!baselineId) {
+      throw new Error('No baseline specified and no active baseline set');
+    }
+    const baseline = this.baselines.get(baselineId);
+    if (!baseline) {
+      throw new Error(`Baseline "${baselineId}" does not exist`);
+    }
+    
+    const baseTask = baseline.tasks.get(taskId);
+    if (!baseTask) {
+      return null; // Task didn't exist at baseline capture time (added later)
+    }
+    
+    if (!this._scheduleCalculated) {
+      this.calculateSchedule();
+    }
+    const currentTask = this.tasks.get(taskId);
+    if (!currentTask) {
+      return {
+        taskId,
+        name: baseTask.name,
+        deleted: true,
+        message: 'Task existed in baseline but has since been deleted'
+      };
+    }
+    
+    const comparisonStart = currentTask.actualStart || currentTask.plannedStart;
+    const comparisonFinish = currentTask.actualFinish || currentTask.plannedFinish;
+    
+    const startVarianceDays = this._signedWorkingDaysDiff(baseTask.plannedStart, comparisonStart);
+    const finishVarianceDays = this._signedWorkingDaysDiff(baseTask.plannedFinish, comparisonFinish);
+    const durationVarianceDays = currentTask.duration - baseTask.duration;
+    const completionVariancePercent = Math.round(
+      (currentTask.percentComplete - baseTask.percentComplete) * 10
+    ) / 10;
+    
+    let scheduleStatus;
+    if (currentTask.actualFinish) {
+      scheduleStatus = finishVarianceDays > 0 ? 'Completed Late'
+        : finishVarianceDays < 0 ? 'Completed Early'
+        : 'Completed On Time';
+    } else {
+      scheduleStatus = finishVarianceDays > 0 ? 'Behind Schedule'
+        : finishVarianceDays < 0 ? 'Ahead of Schedule'
+        : 'On Track';
+    }
+    
+    return {
+      taskId,
+      name: currentTask.name,
+      baseline: {
+        plannedStart: this._formatDate(baseTask.plannedStart),
+        plannedFinish: this._formatDate(baseTask.plannedFinish),
+        duration: baseTask.duration,
+        wasCritical: baseTask.isCritical
+      },
+      current: {
+        plannedStart: this._formatDate(currentTask.plannedStart),
+        plannedFinish: this._formatDate(currentTask.plannedFinish),
+        actualStart: this._formatDate(currentTask.actualStart),
+        actualFinish: this._formatDate(currentTask.actualFinish),
+        duration: currentTask.duration,
+        percentComplete: currentTask.percentComplete,
+        isCritical: currentTask.isCritical
+      },
+      variance: {
+        startVarianceDays,
+        finishVarianceDays,
+        durationVarianceDays,
+        completionVariancePercent
+      },
+      scheduleStatus,
+      criticalityChanged: baseTask.isCritical !== currentTask.isCritical,
+      becameCritical: !baseTask.isCritical && currentTask.isCritical,
+      droppedFromCriticalPath: baseTask.isCritical && !currentTask.isCritical
+    };
+  }
+  
+  /**
+   * Generate a full project-level variance report against a baseline.
+   * This is the primary method for a PMO dashboard "baseline vs actual" view.
+   * 
+   * @param {string} [baselineId] - Defaults to the active baseline
+   * @returns {Object} Full variance report
+   */
+  getVarianceReport(baselineId = this.activeBaselineId) {
+    if (!baselineId) {
+      throw new Error('No baseline specified and no active baseline set');
+    }
+    const baseline = this.baselines.get(baselineId);
+    if (!baseline) {
+      throw new Error(`Baseline "${baselineId}" does not exist`);
+    }
+    
+    if (!this._scheduleCalculated) {
+      this.calculateSchedule();
+    }
+    
+    const taskVariances = Array.from(baseline.tasks.keys())
+      .map(taskId => this.getTaskVariance(taskId, baselineId))
+      .filter(v => v !== null);
+    
+    const currentProjectEndDay = Math.max(...this.getAllTasks().map(t => t.earlyFinish));
+    const currentForecastEnd = this._addWorkingDays(this.startDate, currentProjectEndDay - 1);
+    const projectFinishVarianceDays = this._signedWorkingDaysDiff(
+      baseline.projectEndDate,
+      currentForecastEnd
+    );
+    
+    const behindCount = taskVariances.filter(v => !v.deleted && v.variance.finishVarianceDays > 0 && !v.current.actualFinish).length;
+    const aheadCount = taskVariances.filter(v => !v.deleted && v.variance.finishVarianceDays < 0 && !v.current.actualFinish).length;
+    const onTrackCount = taskVariances.filter(v => !v.deleted && v.variance.finishVarianceDays === 0 && !v.current.actualFinish).length;
+    const newlyCriticalTasks = taskVariances.filter(v => !v.deleted && v.becameCritical).map(v => v.taskId);
+    const droppedCriticalTasks = taskVariances.filter(v => !v.deleted && v.droppedFromCriticalPath).map(v => v.taskId);
+    const deletedTasks = taskVariances.filter(v => v.deleted).map(v => v.taskId);
+    const newTasksSinceBaseline = this.getAllTasks()
+      .filter(t => !baseline.tasks.has(t.taskId))
+      .map(t => t.taskId);
+    
+    return {
+      baselineId,
+      baselineLabel: baseline.label,
+      baselineCapturedAt: baseline.capturedAt,
+      project: {
+        baselineStartDate: this._formatDate(baseline.projectStartDate),
+        baselineEndDate: this._formatDate(baseline.projectEndDate),
+        currentForecastEndDate: this._formatDate(currentForecastEnd),
+        finishVarianceDays: projectFinishVarianceDays,
+        status: projectFinishVarianceDays > 0 ? 'Behind Baseline'
+          : projectFinishVarianceDays < 0 ? 'Ahead of Baseline'
+          : 'On Baseline'
+      },
+      summary: {
+        totalTasksTracked: taskVariances.length,
+        behindSchedule: behindCount,
+        aheadOfSchedule: aheadCount,
+        onTrack: onTrackCount,
+        newlyCriticalTasks,
+        droppedFromCriticalPath: droppedCriticalTasks,
+        tasksDeletedSinceBaseline: deletedTasks,
+        newTasksSinceBaseline
+      },
+      tasks: taskVariances
+    };
   }
   
   // ============================================================
